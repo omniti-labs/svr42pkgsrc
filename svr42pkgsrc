@@ -1,0 +1,166 @@
+#!/usr/bin/bash
+
+BASEURL="http://pkghost/path"
+VENDOR="vendor"
+MAINTAINER="emailaddress"
+
+
+SUPPRESS_USR=1
+
+PART=$SVR4PKGSRC_DEBUG
+if [ -z "$PART" ]; then
+  PART=$$
+fi
+BASEDIR=/var/tmp/svr4-pkgsrc.$PART
+PREFIX=/
+
+if [ -d $BASEDIR ]; then
+	echo "Cleaning old base dir: $BASEDIR"
+	rm -rf $BASEDIR
+fi
+
+CWD=`pwd`
+FILE=$1
+PKG=$2
+die() {
+	echo "$*"
+	exit
+}
+if [ -z "$FILE" -o -z "$PKG" ]; then
+  die "$0 <file:$FILE> <pkg:$PKG>"
+fi
+
+test -d $BASEDIR || mkdir $BASEDIR || die "Cannot mkdir $basedir: $?";
+pushd $BASEDIR >/dev/null
+
+unpack_svr4() {
+	echo "Fetching $BASEURL/$1"
+	curl -s -O $BASEURL/$1 || \
+		die "couldn't fetch file"
+	pkgtrans $1 . $2 > /dev/null || die "Could not pkgtrans file"
+	mkdir root
+	pushd root >/dev/null
+	bzcat ../$2/archive/none.cpio.bz2 | cpio -idmukv > /dev/null
+}
+
+load_info() {
+	while read line
+	do
+	  KEY=INFO_`echo $line | sed -e 's/=.*//'`
+		VALUE=`echo $line | sed -e 's/^[^=]*=//'`
+		eval $KEY=\"$VALUE\"
+	done < "$BASEDIR/$1/pkginfo"
+}
+
+mkcontents() {
+	SIZE=0
+	echo $INFO_DESC > ./+COMMENTS
+	echo $INFO_DESC > ./+DESC
+	echo "@cwd $PREFIX" > ./+CONTENTS
+	echo "@pkgcfl $1-[0-9]" >> ./+CONTENTS
+	if [ -f "$BASEDIR/$1/install/depend" ]; then
+		awk '{if($1=="P") {print "@pkgdep "$2;}}' $BASEDIR/$1/install/depend >> ./+CONTENTS
+	fi
+	echo "@name $1-$INFO_VERSION" >> ./+CONTENTS
+	while read line
+	do
+		if [ "$PREFIX" = "/" -a -n "$SUPPRESS_USR" -a -n "`echo $line | grep ' usr/'`" ]; then
+			echo "WARNING: suppressing stuff out of usr/"
+			echo " >>> $line <<<"
+			continue
+		fi
+		# Handle direcories
+		DIRE=`echo "$line" | awk '{if($2 == "d") { print "@pkgdir "$4; }}' | tee -a ./+CONTENTS`
+		DIR=`echo $DIRE | cut -f1 -d ' '`
+		if [ -d "$DIR" ]; then
+			MODE=`echo "$line" | awk '{print $5;}'`
+			OWNER=`echo "$line" | awk '{print $6;}'`
+			GROUP=`echo "$line" | awk '{print $7;}'`
+			chown $OWNER $DIR
+			chgrp $GROUP $DIR
+			chown $MODE $DIR
+		fi
+
+		# Handle files
+		PROTO=`echo "$line" | awk '{if($2 == "f") { print $4; print "@mode "$5; print "@owner "$6; print "@group "$7; }}' | tee -a ./+CONTENTS`
+		FILE=`echo $PROTO | cut -f1 -d ' '`
+		if [ -f "$FILE" ]; then
+			MD5=`openssl md5 < "$FILE"`
+			FSIZE=`wc -c $FILE | cut -f1 -d ' '`
+			SIZE=$(($SIZE+$FSIZE))
+			echo "@comment MD5:$MD5" >> ./+CONTENTS
+		fi
+
+		# Handle soft links
+		LINK=`echo "$line" | awk '{if($2 == "s") { split($4, a, "="); print a[1]; print "@comment Symlink: "a[2]; print "@owner root"; print "@group root";}}' | tee -a ./+CONTENTS`
+		if [ -n "$LINK" ]; then
+			ln -s `echo "$line" | awk '{if($2 == "s") { split($4, a, "="); print a[2]" "a[1]; }}'` || die "Setting up soft link failed"
+		fi
+	done < "$BASEDIR/$1/pkgmap"
+	cat >> ./+CONTENTS <<EOF
+@cwd $PREFIX
+@ignore
++COMMENT
+@ignore
++DESC
+@ignore
++SIZE_PKG
+@ignore
++SIZE_ALL
+@ignore
++BUILD_INFO
+EOF
+	echo $SIZE > ./+SIZE_PKG
+	echo $SIZE > ./+SIZE_ALL
+	cat > ./+BUILD_INFO <<BINFO
+ABI=64
+CATEGORIES=$VENDOR
+LICENSE=$VENDOR
+LOCALBASE=/
+MACHINE_ARCH=i386
+MACHINE_GNU_ARCH=i386
+MAINTAINER=$MAINTAINER
+OBJECT_FMT=ELF
+OPSYS=SunOS
+OS_VERSION=5.11
+PKGPATH=$VENDOR/$1
+PKGTOOLS_VERSION=20110215
+RESTRICTED=
+_PLIST_IGNORE_FILES=
+_USE_DESTDIR=user-destdir
+BINFO
+}
+
+unpack_svr4 $FILE $PKG
+load_info $PKG
+mkcontents $PKG
+
+ARGS=""
+if [ -f $BASEDIR/$PKG/install/postinstall ]; then
+	awk '{ n = n+1; if(n==2) {print "if [ \"$2\" = \"PRE-INSTALL\" ]; then exit 0; fi";} print; }' \
+		$BASEDIR/$PKG/install/postinstall \
+		> $BASEDIR/root/postinstall
+	chmod 555 ./postinstall
+	ARGS="$ARGS -i ./postinstall"
+fi
+if [ -f $BASEDIR/$PKG/install/preremove ]; then
+	awk '{ n = n+1; if(n==2) {print "if [ \"$2\" = \"POST-DEINSTALL\" ]; then exit 0; fi";} print; }' \
+		$BASEDIR/$PKG/install/preremove \
+		> $BASEDIR/root/preremove
+	chmod 555 ./preremove
+	ARGS="$ARGS -k ./preremove"
+fi
+
+
+echo "Creating pkgsrc package: $PKG"
+pkg_create -K $BASEDIR -I $PREFIX -B ./+BUILD_INFO \
+	-F gzip -p . -S ./+SIZE_ALL -s ./+SIZE_PKG -c ./+COMMENTS \
+	-d ./+DESC -f ./+CONTENTS $ARGS $PKG
+mv $PKG.tgz $CWD
+
+popd >/dev/null
+popd >/dev/null
+if [ -z "$SVR4PKGSRC_DEBUG" ]; then
+	rm -rf $BASEDIR
+fi
+
